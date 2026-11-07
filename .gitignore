@@ -1,0 +1,10 @@
+data/
+outputs/
+*.mp4
+*.avi
+*.pt
+*.pth
+*.safetensors
+__pycache__/
+.ipynb_checkpoints/
+.env

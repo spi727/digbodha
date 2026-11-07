@@ -1,0 +1,19 @@
+# Python 3.12 | CUDA 12.8 build of PyTorch
+# Install PyTorch first:
+#   pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+
+torch==2.10.0
+torchvision==0.25.0
+
+# SAM 3 / 3.1 (requires numpy<2)
+sam3 @ git+https://github.com/facebookresearch/sam3.git
+
+numpy>=1.26,<2
+opencv-python>=4.10,<4.11
+scipy==1.17.1
+pandas==3.0.6
+matplotlib==3.11.2
+einops==0.8.2
+huggingface_hub==2.4.0
+pyyaml
+tqdm
