@@ -197,7 +197,7 @@ def _link_ids(prev_tail, new_head, next_id, iou_thresh=0.3):
 
 # ----------------------------------------------------------------------------- main entry
 def segment_video(predictor, frames_dir, prompts, chunk=60, overlap=2,
-                  iou_thresh=0.3, grace=10, stats=None, verbose=True):
+                  iou_thresh=0.3, grace=10, stats=None, verbose=True, min_chunk=15):
     """Generator over frames in order. Each item:
         {"frame": global index, "path": jpg path,
          "objects": [{"id", "label", "prob", "box_xywh", "mask"}, ...]}
@@ -206,16 +206,33 @@ def segment_video(predictor, frames_dir, prompts, chunk=60, overlap=2,
     if isinstance(prompts, str):
         prompts = [p.strip() for p in prompts.split(",") if p.strip()]
     paths = list_frames(frames_dir)
-    ranges = chunk_ranges(len(paths), chunk, overlap)
+    n_frames = len(paths)
     if verbose:
-        print(f"[segment] {len(paths)} frames -> {len(ranges)} chunks of <= {chunk} "
-              f"(overlap {overlap}), prompts {prompts}")
+        print(f"[segment] {n_frames} frames, chunks of <= {chunk} (overlap {overlap}, "
+              f"halved on out-of-memory down to {min_chunk}), prompts {prompts}")
 
+    # Chunks are planned on the fly: memory use depends on how many objects are tracked, so a
+    # crowded scene can overflow the GPU at a chunk length that is safe for a quiet one. On
+    # out-of-memory the same chunk is retried at half the length, and that length is kept.
     prev_tail, next_id = None, 1
-    for c, (start, end) in enumerate(ranges):
+    start, c, cur_chunk = 0, 0, chunk
+    while start < n_frames:
+        end = min(start + cur_chunk, n_frames)
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
-        per_frame = _run_chunk(predictor, paths[start:end], prompts)
+        try:
+            per_frame = _run_chunk(predictor, paths[start:end], prompts)
+        except RuntimeError as err:  # torch.OutOfMemoryError and "CUDA driver error: out of memory"
+            if "out of memory" not in str(err).lower() or cur_chunk <= min_chunk:
+                raise
+            gc.collect()
+            torch.cuda.empty_cache()
+            new_len = max(min_chunk, cur_chunk // 2)
+            if verbose:
+                print(f"[segment] out of GPU memory on frames {start}-{end - 1} "
+                      f"({cur_chunk}-frame chunk) -> retrying with {new_len}-frame chunks")
+            cur_chunk = new_len
+            continue
         elapsed = time.perf_counter() - t0
         peak = torch.cuda.max_memory_allocated() / 1e9
 
@@ -276,6 +293,7 @@ def segment_video(predictor, frames_dir, prompts, chunk=60, overlap=2,
 
         if stats is not None:
             stats.append({"chunk": c, "start": start, "end": end, "frames": end - start,
+                          "chunk_len": cur_chunk,
                           "seconds": round(elapsed, 2), "fps": round((end - start) / elapsed, 2),
                           "peak_vram_gb": round(peak, 2),
                           "objects": len(mapping), "linked_from_prev": n_matched})
@@ -294,3 +312,6 @@ def segment_video(predictor, frames_dir, prompts, chunk=60, overlap=2,
         del per_frame
         gc.collect()
         torch.cuda.empty_cache()
+        if end >= n_frames:
+            break
+        start, c = end - overlap, c + 1

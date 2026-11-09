@@ -71,7 +71,7 @@ class TTCEstimator:
     def __init__(self, fps, window_s=0.8, min_frames=5, ttc_max=10.0,
                  miss_thresh=1.0, danger_ttc=2.0, caution_ttc=4.0, near_pass_ttc=1.5,
                  still_px_per_s=15.0, min_size_px=30.0, edge_px=2, jump_ratio=1.25,
-                 jump_max_frac=0.25):
+                 jump_max_frac=0.25, debounce=1, turn_px=5.0):
         """
         fps           : frame rate of the video (KITTI: 10).
         window_s      : length of the fitting window in seconds.
@@ -86,7 +86,14 @@ class TTCEstimator:
         edge_px       : box within this many px of the top/bottom edge -> cut (unreliable).
         jump_ratio    : box height changing by more than this factor between frames ...
         jump_max_frac : ... while shorter than this fraction of the image -> "size_jump".
+        debounce      : a caution/danger must hold this many consecutive frames before it is raised
+                        (removes one-frame flicker across a threshold; 1 = off).
+        turn_px       : camera-induced horizontal image motion at the object (px/frame) above which
+                        the camera counts as turning (width-based TTC is then not trusted).
         """
+        self.debounce = max(1, int(debounce))
+        self.turn_px = turn_px
+        self.raw_hist = {}  # id -> recent raw risks, for debouncing
         self.min_size_px = min_size_px
         self.edge_px = edge_px
         self.jump_ratio = jump_ratio
@@ -105,37 +112,60 @@ class TTCEstimator:
 
     def update(self, frame_idx, objects, ego_res=None):
         """objects: [{"id", "label", "mask"}, ...] for this frame.
-        ego_res : output of EgoMotion.step for this frame (optional; for border and motion labels).
+        ego_res : output of EgoMotion.step for this frame (optional; motion label, turning, camera check).
         Returns {id: estimate dict}."""
-        t = frame_idx / self.fps
-        out = {}
-        seen = set()
+        items = []
         for o in objects:
-            oid, mask = o["id"], o["mask"]
-            seen.add(oid)
-            h, w = mask.shape
-            self.img_h = h
-            box = clean_box(mask)
+            h, w = o["mask"].shape
+            box = clean_box(o["mask"])
             if box is None:
                 continue
-            xc, bw, bh, bbox = box
-            x = xc - w / 2.0                       # offset from the heading (image centre)
-            ego_o = (ego_res or {}).get("objects", {}).get(oid, {})
-            # Which image edge cuts the object matters: a TOP/BOTTOM cut corrupts its height (and
-            # so the TTC); a LEFT/RIGHT cut leaves the height intact and only shifts the visible
-            # centre toward the image middle, which biases the miss distance toward "on course"
-            # (the safe direction for a warning system), so it does not make the estimate unreliable.
-            x0, y0, x1, y1 = bbox
+            ego_o = (ego_res or {}).get("objects", {}).get(o["id"], {})
+            items.append({"id": o["id"], "label": o.get("label", ""), "box": box[3],
+                          "raw_flow": ego_o.get("raw_flow"), "own_flow": ego_o.get("own_flow")})
+        cam_ok = True if ego_res is None else ego_res.get("camera", {}).get("reliable", True)
+        return self.update_boxes(frame_idx, items, w if objects else 0, h if objects else 0, cam_ok)
+
+    def update_boxes(self, frame_idx, items, img_w, img_h, camera_reliable=True):
+        """Same as update() but from boxes already measured (used to re-score saved results).
+        items: [{"id", "label", "box": (x0, y0, x1, y1), "raw_flow", "own_flow"}, ...]"""
+        t = frame_idx / self.fps
+        out, seen = {}, set()
+        self.img_h = img_h
+        for it in items:
+            oid = it["id"]
+            seen.add(oid)
+            x0, y0, x1, y1 = it["box"]
+            bw, bh = float(x1 - x0), float(y1 - y0)
+            x = (x0 + x1) / 2.0 - img_w / 2.0      # offset from the heading (image centre)
+            # Which image edge cuts the object matters: a TOP/BOTTOM cut corrupts its height; a
+            # LEFT/RIGHT cut leaves the height intact and only shifts the visible centre toward the
+            # image middle, which biases the miss distance toward "on course" (the safe direction).
             m = self.edge_px
-            cut_tb = y0 <= m or y1 >= h - m
-            cut_side = x0 <= m or x1 >= w - m
+            cut_tb = y0 <= m or y1 >= img_h - m
+            cut_side = x0 <= m or x1 >= img_w - m
+            raw, own = it.get("raw_flow"), it.get("own_flow")
+            cam_dx = (raw[0] - own[0]) if (raw is not None and own is not None) else None
             dq = self.hist.setdefault(oid, deque(maxlen=self.window))
-            dq.append((t, x, bw, bh, cut_tb, cut_side))
-            out[oid] = self._estimate(oid, o.get("label", ""), dq, w, ego_o, ego_res)
-            out[oid]["box"] = bbox
+            dq.append((t, x, bw, bh, cut_tb, cut_side, cam_dx))
+            res = self._estimate(oid, it.get("label", ""), dq, img_w, {"own_flow": own},
+                                 {"camera": {"reliable": camera_reliable}})
+            # debounce: raise caution/danger only once it has held for `debounce` frames, at the
+            # lowest level seen over those frames
+            rh = self.raw_hist.setdefault(oid, deque(maxlen=self.debounce))
+            rh.append(res["risk"])
+            if res["risk"] in ("caution", "danger"):
+                if len(rh) < self.debounce or any(r not in ("caution", "danger") for r in rh):
+                    res["risk"] = "safe"
+                    res["debounced"] = True
+                elif "caution" in rh:
+                    res["risk"] = "caution"
+            res["box"] = tuple(int(v) for v in it["box"])
+            out[oid] = res
         for oid in list(self.hist):  # forget objects not seen for a while
             if oid not in seen and self.hist[oid] and t - self.hist[oid][-1][0] > 1.0:
                 del self.hist[oid]
+                self.raw_hist.pop(oid, None)
         return out
 
     # ------------------------------------------------------------------------------
@@ -147,7 +177,15 @@ class TTCEstimator:
         # Image size = box HEIGHT. Height depends only on distance; width also changes with viewing
         # angle (swinging around a parked car shows more of its side) and grows when an object
         # emerges from behind an occluder. With height, an emerging object simply isn't approaching.
-        ss = hs
+        # Exception: an object cut at the top or bottom (a nearby car whose lower part has left the
+        # frame) has a useless height but an intact width -> use WIDTH, trusted only if no side cut
+        # and the camera is not turning (turning changes the width of what we see).
+        cut_tb_any = any(p[4] for p in dq)
+        side_any = any(p[5] for p in dq)
+        cam = [abs(p[6]) for p in dq if p[6] is not None]
+        turning = bool(cam) and float(np.mean(cam)) > self.turn_px
+        use_width = cut_tb_any and not side_any
+        ss = ws if use_width else hs
         x_now, s_now = xs[-1], ss[-1]
         zone = "left" if x_now < -img_w / 6 else ("right" if x_now > img_w / 6 else "centre")
 
@@ -155,7 +193,8 @@ class TTCEstimator:
                "n_frames": len(dq), "expansion_per_s": None, "ttc_s": None,
                "ttc_lo": None, "ttc_hi": None, "approaching": None, "miss_widths": None,
                "on_course": None, "motion": self._motion_label(ego_o, ego_res),
-               "risk": "safe", "reliable": False, "reasons": [], "cut_side": False}
+               "risk": "safe", "reliable": False, "reasons": [], "cut_side": False,
+               "size_from": "width" if use_width else "height"}
 
         if len(dq) < self.min_frames:
             res["reasons"].append("warming_up")
@@ -194,16 +233,18 @@ class TTCEstimator:
                 res["risk"] = "caution"
 
         # reliability: enough history, real expansion (when approaching), no edge cut, steady camera
-        if any(p[4] for p in dq):
-            res["reasons"].append("cut_top_bottom")
+        if cut_tb_any and not use_width:
+            res["reasons"].append("cut_top_bottom")      # cut at top/bottom AND at a side
+        if use_width and turning:
+            res["reasons"].append("cut_and_turning")
         res["cut_side"] = bool(dq[-1][5])
         # A sudden height jump between consecutive frames on an object that is still small in the
         # image is a mask glitch or occlusion, not motion (a real 25% jump in 0.1 s would mean
         # contact within ~0.4 s, which only happens to objects that already fill much of the view).
-        jumps = np.maximum(hs[1:] / hs[:-1], hs[:-1] / hs[1:]) if len(hs) > 1 else np.array([1.0])
+        jumps = np.maximum(ss[1:] / ss[:-1], ss[:-1] / ss[1:]) if len(ss) > 1 else np.array([1.0])
         if jumps.max() > self.jump_ratio and hs[-1] < self.jump_max_frac * self.img_h:
             res["reasons"].append("size_jump")
-        if approaching and ws[-1] < 0.85 * ws[0]:
+        if approaching and not use_width and ws[-1] < 0.85 * ws[0]:
             # height says "closer" but the width shrank by >15%: physically odd for an approaching
             # object (usually a mask that lost part of the object) -> don't trust it
             res["reasons"].append("inconsistent_growth")
