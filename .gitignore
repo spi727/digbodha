@@ -7,4 +7,4 @@ outputs/
 *.safetensors
 __pycache__/
 .ipynb_checkpoints/
-.env
+.envdigbodha_results_pack.zip
