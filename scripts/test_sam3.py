@@ -87,6 +87,9 @@ def main():
     parser.add_argument("--grounding_batch", type=int, default=0,
                         help="detector frames per batch; 0 = off (one frame at a time)")
     parser.add_argument("--compile", action="store_true", help="use torch.compile (slow first run)")
+    parser.add_argument("--log_every", type=int, default=10, help="print speed/VRAM every N frames")
+    parser.add_argument("--low_mem", action="store_true",
+                        help="keep video frames on CPU, trim old tracking memory, offload outputs to CPU")
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -116,7 +119,11 @@ def main():
         dropped = [k for k in kw if k not in accepted]
         if dropped:
             print(f"  [compat] ignoring unsupported init_state args: {dropped}")
-        return original_init_state(*a, **{k: v for k, v in kw.items() if k in accepted})
+        kw = {k: v for k, v in kw.items() if k in accepted}
+        if args.low_mem and "offload_video_to_cpu" in accepted:
+            kw["offload_video_to_cpu"] = True  # decoded frames stay in system RAM
+            print("  [low_mem] offload_video_to_cpu=True")
+        return original_init_state(*a, **kw)
 
     predictor.model.init_state = init_state_compat
 
@@ -134,6 +141,22 @@ def main():
         m.batched_grounding_batch_size = 1
     print(f"  batched grounding now: use={m.use_batched_grounding}, "
           f"batch_size={m.batched_grounding_batch_size}")
+
+    # Low-memory mode: stop per-frame tracking state from piling up on the GPU.
+    # These options exist in SAM 3.1 but are switched off in the demo config.
+    if args.low_mem:
+        targets = {"model": m}
+        if hasattr(m, "tracker"):
+            targets["model.tracker"] = m.tracker
+        for opt in ("trim_past_non_cond_mem_for_eval", "offload_output_to_cpu_for_eval"):
+            found = False
+            for name, obj in targets.items():
+                if hasattr(obj, opt):
+                    print(f"  [low_mem] {name}.{opt}: {getattr(obj, opt)} -> True")
+                    setattr(obj, opt, True)
+                    found = True
+            if not found:
+                print(f"  [low_mem] {opt}: not found on model or tracker (no effect)")
 
     # Optional bfloat16: tensor cores run bf16 much faster and it halves activation memory
     import contextlib
@@ -168,11 +191,32 @@ def main():
     t0 = time.perf_counter()
 
     outputs_per_frame = {}
+    log_rows = []  # (frame, seconds_per_frame, vram_allocated_gb, vram_reserved_gb)
+    t_prev = time.perf_counter()
     with amp():
         for r in predictor.handle_stream_request(
             request=dict(type="propagate_in_video", session_id=session_id)
         ):
             outputs_per_frame[r["frame_index"]] = r["outputs"]
+            t_now = time.perf_counter()
+            alloc = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            log_rows.append((r["frame_index"], t_now - t_prev, alloc, reserved))
+            t_prev = t_now
+            if len(log_rows) % args.log_every == 0:
+                recent = log_rows[-args.log_every:]
+                avg = sum(x[1] for x in recent) / len(recent)
+                print(f"    frame {r['frame_index']:4d}: {avg:.2f} s/frame "
+                      f"(last {len(recent)}), VRAM alloc {alloc:.2f} GB, reserved {reserved:.2f} GB")
+
+    # Save the per-frame log so the slowdown can be plotted for the report
+    import csv
+    log_path = os.path.join(args.out, "frame_log.csv")
+    with open(log_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["frame", "sec_per_frame", "vram_alloc_gb", "vram_reserved_gb"])
+        w.writerows(log_rows)
+    print(f"  per-frame log saved to {log_path}")
 
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
@@ -206,4 +250,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 

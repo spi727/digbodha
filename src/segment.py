@@ -88,6 +88,25 @@ def chunk_ranges(n_frames, chunk=60, overlap=2):
         start = end - overlap
 
 
+def _centroid(mask):
+    ys, xs = np.nonzero(mask)
+    return (xs.mean(), ys.mean()) if len(xs) else None
+
+
+def _shift_mask(mask, dx, dy):
+    """Translate a boolean mask by (dx, dy) pixels; pixels shifted out are dropped."""
+    dx, dy = int(round(dx)), int(round(dy))
+    if dx == 0 and dy == 0:
+        return mask
+    h, w = mask.shape
+    out = np.zeros_like(mask)
+    xs0, xs1 = max(0, dx), min(w, w + dx)
+    ys0, ys1 = max(0, dy), min(h, h + dy)
+    if xs0 < xs1 and ys0 < ys1:
+        out[ys0:ys1, xs0:xs1] = mask[ys0 - dy:ys1 - dy, xs0 - dx:xs1 - dx]
+    return out
+
+
 def mask_iou(a, b):
     union = np.logical_or(a, b).sum()
     return float(np.logical_and(a, b).sum() / union) if union else 0.0
@@ -178,7 +197,7 @@ def _link_ids(prev_tail, new_head, next_id, iou_thresh=0.3):
 
 # ----------------------------------------------------------------------------- main entry
 def segment_video(predictor, frames_dir, prompts, chunk=60, overlap=2,
-                  iou_thresh=0.3, grace=5, stats=None, verbose=True):
+                  iou_thresh=0.3, grace=10, stats=None, verbose=True):
     """Generator over frames in order. Each item:
         {"frame": global index, "path": jpg path,
          "objects": [{"id", "label", "prob", "box_xywh", "mask"}, ...]}
@@ -212,13 +231,22 @@ def segment_video(predictor, frames_dir, prompts, chunk=60, overlap=2,
         else:
             mapping, next_id, n_matched = _link_ids(prev_tail, per_frame[:n_head], next_id, iou_thresh)
 
-            # Grace window: SAM sometimes picks an object up a few frames into the new chunk.
-            # Compare such late objects with previous objects that are still unmatched,
-            # using the previous chunk's last mask of each.
+            # Grace window: SAM sometimes picks an object up several frames into the new chunk.
+            # Compare such late objects with previous objects that are still unmatched. A fast
+            # object has moved by then, so its last mask is first shifted by its velocity
+            # (constant-velocity prediction from the last two overlap frames).
             last_prev = prev_tail[-1]
             used = set(mapping.values())
-            for fr in per_frame[n_head:n_head + grace]:
-                for o in fr:
+            velocity = {}
+            if len(prev_tail) >= 2:
+                for key_p, m_last in last_prev.items():
+                    m_before = prev_tail[-2].get(key_p)
+                    c1, c0 = _centroid(m_last), _centroid(m_before) if m_before is not None else None
+                    if c1 is not None and c0 is not None:
+                        velocity[key_p] = (c1[0] - c0[0], c1[1] - c0[1])
+            for i in range(n_head, min(n_head + grace, len(per_frame))):
+                dt = i - (n_head - 1)  # frames since the last overlap frame
+                for o in per_frame[i]:
                     key = (o["label"], o["local_id"])
                     if key in mapping:
                         continue
@@ -226,7 +254,8 @@ def segment_video(predictor, frames_dir, prompts, chunk=60, overlap=2,
                     for (lab, gid), m_prev in last_prev.items():
                         if lab != o["label"] or gid in used:
                             continue
-                        v = mask_iou(m_prev, o["mask"])
+                        vx, vy = velocity.get((lab, gid), (0.0, 0.0))
+                        v = mask_iou(_shift_mask(m_prev, vx * dt, vy * dt), o["mask"])
                         if v >= best_iou:
                             best_gid, best_iou = gid, v
                     if best_gid is not None:
