@@ -1,225 +1,276 @@
-DigBodha 1
-Text-Prompted Motion & Collision-Risk Estimation from a Single Camera
-Open-vocabulary video segmentation · Ego-motion compensation · Calibration-free time to contact · Interpretable collision-risk assessment
+<div align="center">
 
-Python Computer Vision Dataset
+# DigBodha 1
 
-Computer Vision Course Project · M.Tech CSE (Data Science & AI) · IIITDM Kancheepuram
+### Text-Prompted Motion & Collision-Risk Estimation from a Single Camera
 
-Overview · Architecture · Quick Start · Results · Limitations · References
+**Open-vocabulary video segmentation · Ego-motion compensation · Calibration-free time to contact · Interpretable collision-risk assessment**
 
-[!IMPORTANT] Research prototype, not a deployable safety system. The evaluated implementation operates offline and its risk estimates can be wrong or unavailable. Do not rely on it for driving, navigation, or collision avoidance.
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Computer Vision](https://img.shields.io/badge/Computer%20Vision-Research%20Prototype-465C9B)](#overview)
+[![Dataset](https://img.shields.io/badge/Evaluation-KITTI-37665A)](https://www.cvlibs.net/datasets/kitti/)
 
-Overview
-DigBodha 1 takes a monocular video and text prompts such as vehicle,person, then tracks the matching objects and estimates their motion and potential collision risk relative to the camera.
+**Computer Vision Course Project · M.Tech CSE (Data Science & AI) · IIITDM Kancheepuram**
 
-Ordinary object detection answers “What is in the scene?” DigBodha extends that to:
+[Overview](#overview) · [Architecture](#system-architecture) · [Quick Start](#getting-started) · [Results](#evaluation-and-results) · [Limitations](#limitations) · [References](#references)
 
-Where is it? Instance masks, bounding boxes, and left/centre/right zones.
-Which object is it? Persistent track IDs while an object remains in view.
-How is it moving? Raw image motion and camera-compensated motion.
-Is it approaching? Apparent-size expansion over time.
-When could it reach the camera’s plane? Time to contact (TTC) with a low/high uncertainty band.
-Will it pass or be on course? Predicted lateral miss distance at contact.
-How trustworthy is the estimate? Explicit reliability flags and reasons.
-The pipeline deliberately combines a pretrained SAM 3.1 video model for text-prompted instance segmentation and tracking with classical computer vision and geometric estimation for motion, TTC, and risk. No task-specific model training or fine-tuning was performed for this project.
+</div>
 
-Key capabilities
-Capability	Implementation
-Text-prompted instance segmentation	SAM 3.1 video predictor
-Object identity across video chunks	Mask IoU, Hungarian assignment, short velocity-based grace window
-Image feature selection	Shi–Tomasi corners
-Point tracking	Pyramidal Lucas–Kanade optical flow + forward–backward consistency
-Camera-motion estimation	Background homography fitted with RANSAC
-Independent image motion	Observed optical flow minus homography-predicted camera flow
-Time to contact	Least-squares line fit to inverse object height, 1/s
-Collision-course prediction	Extrapolated normalized lateral offset
-Risk assessment	Rule-based safe, caution, danger, uncertain
-Evaluation	KITTI Tracking 3D annotations, frame and hazard-event metrics
-System architecture
-Monocular video / JPG frame folder
+> [!IMPORTANT]
+> **Research prototype, not a deployable safety system.** The evaluated implementation operates offline and its risk estimates can be wrong or unavailable. Do **not** rely on it for driving, navigation, or collision avoidance.
 
-SAM 3.1
+## Overview
 
-Text prompts: vehicle, person, ...
+**DigBodha 1** takes a monocular video and text prompts such as `vehicle,person`, then tracks the matching objects and estimates their motion and potential collision risk relative to the camera.
 
-Instance masks + object IDs
+Ordinary object detection answers **“What is in the scene?”** DigBodha extends that to:
 
-Chunk overlap and ID linking
+- **Where is it?** Instance masks, bounding boxes, and left/centre/right zones.
+- **Which object is it?** Persistent track IDs while an object remains in view.
+- **How is it moving?** Raw image motion and camera-compensated motion.
+- **Is it approaching?** Apparent-size expansion over time.
+- **When could it reach the camera's plane?** Time to contact (TTC) with a low/high uncertainty band.
+- **Will it pass or be on course?** Predicted lateral miss distance at contact.
+- **How trustworthy is the estimate?** Explicit reliability flags and reasons.
 
-Clean masks and bounding boxes
+The pipeline deliberately combines a **pretrained SAM 3.1 video model** for text-prompted instance segmentation and tracking with **classical computer vision and geometric estimation** for motion, TTC, and risk. No task-specific model training or fine-tuning was performed for this project.
 
-Background corner tracking
+### Key capabilities
 
-Shi–Tomasi + pyramidal Lucas–Kanade
+| Capability | Implementation |
+|---|---|
+| Text-prompted instance segmentation | SAM 3.1 video predictor |
+| Object identity across video chunks | Mask IoU, Hungarian assignment, short velocity-based grace window |
+| Image feature selection | Shi–Tomasi corners |
+| Point tracking | Pyramidal Lucas–Kanade optical flow + forward–backward consistency |
+| Camera-motion estimation | Background homography fitted with RANSAC |
+| Independent image motion | Observed optical flow minus homography-predicted camera flow |
+| Time to contact | Least-squares line fit to inverse object height, `1/s` |
+| Collision-course prediction | Extrapolated normalized lateral offset |
+| Risk assessment | Rule-based `safe`, `caution`, `danger`, `uncertain` |
+| Evaluation | KITTI Tracking 3D annotations, frame and hazard-event metrics |
 
-RANSAC homography
+## System architecture
 
-Camera-compensated object motion
+```mermaid
+flowchart TD
+    A[Monocular video / JPG frame folder] --> B[SAM 3.1]
+    P[Text prompts: vehicle, person, ...] --> B
+    B --> C[Instance masks + object IDs]
+    C --> D[Chunk overlap and ID linking]
+    D --> E[Clean masks and bounding boxes]
+    D --> F[Background corner tracking]
+    F --> G[Shi–Tomasi + pyramidal Lucas–Kanade]
+    G --> H[RANSAC homography]
+    H --> I[Camera-compensated object motion]
+    E --> J[Object size and horizontal offset history]
+    J --> K[Inverse-size TTC fit]
+    J --> L[Collision-course / miss-distance fit]
+    I --> M[Motion labels and reliability signals]
+    K --> N[Risk rules + reliability checks]
+    L --> N
+    M --> N
+    N --> O[frames.csv]
+    N --> Q[tracks.json]
+    N --> R[annotated.mp4]
+    N --> S[run.json]
+```
 
-Object size and horizontal offset history
+### Stage 1 — Text-prompted segmentation and tracking
 
-Inverse-size TTC fit
+[`src/segment.py`](src/segment.py) loads the SAM 3.1 multiplex video predictor and follows objects matching the requested concepts.
 
-Collision-course / miss-distance fit
+SAM tracking state grows with video length, so the implementation uses **60-frame chunks with a 2-frame overlap** by default. Objects are linked between chunks through overlap-mask IoU and Hungarian matching (threshold **0.3**). A **10-frame velocity-shifted grace window** helps recover objects that briefly disappear around a chunk boundary. When a chunk fails due to GPU memory pressure, processing can retry at smaller chunk sizes, down to 15 frames.
 
-Motion labels and reliability signals
+The tracker supports up to **16 objects** in the default pipeline configuration. It does **not** re-identify an object after that object completely leaves the camera view and re-enters.
 
-Risk rules + reliability checks
+### Stage 2 — Ego-motion and independent object motion
 
-frames.csv
+[`src/egomotion.py`](src/egomotion.py) estimates the camera-induced motion that would make stationary scene points move in the image:
 
-tracks.json
+1. Downscale frames to **640 px width** and convert to grayscale.
+2. Exclude detected objects (including a dilated boundary) from background feature selection.
+3. Detect up to **800 Shi–Tomasi corners** on the background.
+4. Track corners using **pyramidal Lucas–Kanade** with a forward–backward consistency check.
+5. Fit a **3×3 homography** to the background correspondences using **RANSAC**.
+6. Track up to **60 feature points per object** and subtract the predicted camera motion.
 
-annotated.mp4
+For a tracked image point `p`, independent (camera-compensated) motion is:
 
-run.json
+$$
+\mathbf{v}_{\mathrm{own}}=\mathbf{p}_{t}-H(\mathbf{p}_{t-1}),
+$$
 
-Stage 1 — Text-prompted segmentation and tracking
-src/segment.py loads the SAM 3.1 multiplex video predictor and follows objects matching the requested concepts.
+where `H(p)` denotes the homography-warped point in Cartesian image coordinates. If too few valid points survive, object-motion estimation falls back to the mask centroid.
 
-SAM tracking state grows with video length, so the implementation uses 60-frame chunks with a 2-frame overlap by default. Objects are linked between chunks through overlap-mask IoU and Hungarian matching (threshold 0.3). A 10-frame velocity-shifted grace window helps recover objects that briefly disappear around a chunk boundary. When a chunk fails due to GPU memory pressure, processing can retry at smaller chunk sizes, down to 15 frames.
+A homography is exact for pure camera rotation or a planar scene; with translating cameras and general 3D backgrounds it is an **approximation** because of parallax. The estimated camera motion supports motion labels and reliability checking, while **TTC is computed from raw image-size measurements** to preserve motion relative to the camera.
 
-The tracker supports up to 16 objects in the default pipeline configuration. It does not re-identify an object after that object completely leaves the camera view and re-enters.
+### Stage 3 — Time to contact, collision course, and reliability
 
-Stage 2 — Ego-motion and independent object motion
-src/egomotion.py estimates the camera-induced motion that would make stationary scene points move in the image:
+[`src/ttc.py`](src/ttc.py) measures the bounding box of the largest connected component of each object mask. **Object height** is the preferred apparent-size measurement; **width** can be used when the top or bottom is truncated but the sides remain usable.
 
-Downscale frames to 640 px width and convert to grayscale.
-Exclude detected objects (including a dilated boundary) from background feature selection.
-Detect up to 800 Shi–Tomasi corners on the background.
-Track corners using pyramidal Lucas–Kanade with a forward–backward consistency check.
-Fit a 3×3 homography to the background correspondences using RANSAC.
-Track up to 60 feature points per object and subtract the predicted camera motion.
-For a tracked image point p, independent (camera-compensated) motion is:
+#### Time to contact from looming
 
-$$ \mathbf{v}{\mathrm{own}}=\mathbf{p}{t}-H(\mathbf{p}_{t-1}), $$
+In a pinhole camera, an object of physical height `H` at depth `Z` has apparent image height `s`:
 
-where H(p) denotes the homography-warped point in Cartesian image coordinates. If too few valid points survive, object-motion estimation falls back to the mask centroid.
+$$
+s(t)=\frac{fH}{Z(t)}, \qquad \frac{1}{s(t)}=\frac{Z(t)}{fH}.
+$$
 
-A homography is exact for pure camera rotation or a planar scene; with translating cameras and general 3D backgrounds it is an approximation because of parallax. The estimated camera motion supports motion labels and reliability checking, while TTC is computed from raw image-size measurements to preserve motion relative to the camera.
+For approximately constant closing speed, `1/s` is linear in time. DigBodha fits
 
-Stage 3 — Time to contact, collision course, and reliability
-src/ttc.py measures the bounding box of the largest connected component of each object mask. Object height is the preferred apparent-size measurement; width can be used when the top or bottom is truncated but the sides remain usable.
+$$
+u(t)=\frac{1}{s(t)}=a+bt
+$$
 
-Time to contact from looming
-In a pinhole camera, an object of physical height H at depth Z has apparent image height s:
+using a recent **0.8-second** history, then estimates remaining TTC as
 
-$$ s(t)=\frac{fH}{Z(t)}, \qquad \frac{1}{s(t)}=\frac{Z(t)}{fH}. $$
+$$
+\boxed{\mathrm{TTC}=\frac{u_{\mathrm{now}}}{-b}}\quad\text{for }b<0.
+$$
 
-For approximately constant closing speed, 1/s is linear in time. DigBodha fits
+The object’s real height and the camera focal length cancel: **the TTC estimate does not require explicit metric distance, object size, or camera calibration** under this model. The estimator needs **at least five observations**, limits estimates to a **10-second horizon**, and derives a low/high band from the fitted slope's standard error. These bounds are diagnostic uncertainty estimates, **not calibrated probabilistic confidence intervals**.
 
-$$ u(t)=\frac{1}{s(t)}=a+bt $$
+The final implementation fits `1/s` rather than `log(s)`: the latter produced delayed TTC estimates under constant-speed approach in the team's experiments.
 
-using a recent 0.8-second history, then estimates remaining TTC as
+#### Collision course
 
-$$ \boxed{\mathrm{TTC}=\frac{u_{\mathrm{now}}}{-b}}\quad\text{for }b<0. $$
+TTC answers **when** an object reaches the camera's depth plane, not **whether it will be in the camera's path**. Let `x` be the object's horizontal image offset from the image centre and `s` its image height:
 
-The object’s real height and the camera focal length cancel: the TTC estimate does not require explicit metric distance, object size, or camera calibration under this model. The estimator needs at least five observations, limits estimates to a 10-second horizon, and derives a low/high band from the fitted slope’s standard error. These bounds are diagnostic uncertainty estimates, not calibrated probabilistic confidence intervals.
+$$
+q=\frac{x}{s}, \qquad m=q_{\mathrm{now}}+\dot q\,\mathrm{TTC}.
+$$
 
-The final implementation fits 1/s rather than log(s): the latter produced delayed TTC estimates under constant-speed approach in the team’s experiments.
+`m` is the predicted lateral miss distance in **object-height units**. In the implemented heuristic, an object is **on course** when `|m| < 1`. This assumes the image centre approximately represents the direction of travel and lateral motion can be extrapolated over the prediction horizon.
 
-Collision course
-TTC answers when an object reaches the camera’s depth plane, not whether it will be in the camera’s path. Let x be the object’s horizontal image offset from the image centre and s its image height:
+> **Schema note:** The output column is named `miss_widths` for historical reasons, but the current implementation measures miss distance in **object heights**.
 
-$$ q=\frac{x}{s}, \qquad m=q_{\mathrm{now}}+\dot q,\mathrm{TTC}. $$
+#### Risk rules
 
-m is the predicted lateral miss distance in object-height units. In the implemented heuristic, an object is on course when |m| < 1. This assumes the image centre approximately represents the direction of travel and lateral motion can be extrapolated over the prediction horizon.
+| Output | Default condition |
+|---|---|
+| `danger` | On course and TTC < **2 s** |
+| `caution` | On course and TTC < **4 s**, **or** approaching with TTC < **1.5 s** (close pass) |
+| `safe` | No caution/danger condition applies |
+| `uncertain` | A caution/danger condition is indicated, but at least one reliability check failed |
 
-Schema note: The output column is named miss_widths for historical reasons, but the current implementation measures miss distance in object heights.
+Reliability checks flag cases such as `warming_up`, `too_small`, `noisy_expansion`, `size_jump`, `inconsistent_growth`, `camera_unreliable`, `cut_top_bottom`, and `cut_and_turning`. The optional warning debounce is **disabled by default** (`debounce=1`) because a longer debounce reduced false alarms but also missed hazards in the team's tests.
 
-Risk rules
-Output	Default condition
-danger	On course and TTC < 2 s
-caution	On course and TTC < 4 s, or approaching with TTC < 1.5 s (close pass)
-safe	No caution/danger condition applies
-uncertain	A caution/danger condition is indicated, but at least one reliability check failed
-Reliability checks flag cases such as warming_up, too_small, noisy_expansion, size_jump, inconsistent_growth, camera_unreliable, cut_top_bottom, and cut_and_turning. The optional warning debounce is disabled by default (debounce=1) because a longer debounce reduced false alarms but also missed hazards in the team’s tests.
+## Getting started
 
-Getting started
-Requirements
-Python 3.12 (the development environment used for this project).
-NVIDIA CUDA-capable GPU for SAM inference; the project was tested on an RTX 5060 Laptop GPU (8 GB VRAM) under WSL2 Ubuntu.
-A compatible CUDA/PyTorch installation (the repository pins PyTorch 2.10.0 and a CUDA 12.8 wheel for the documented environment).
-Access to the required Meta SAM 3 / 3.1 model checkpoints on Hugging Face. Checkpoint access may require approval and authentication.
-Sufficient RAM, disk space, and available GPU memory for input frames and SAM tracking state.
-[!NOTE] These are the documented development settings, not a verified cross-platform support matrix. Memory usage depends on frame count, number of objects, prompts, and resolution.
+### Requirements
 
-1. Clone the repository
+- **Python 3.12** (the development environment used for this project).
+- **NVIDIA CUDA-capable GPU** for SAM inference; the project was tested on an **RTX 5060 Laptop GPU (8 GB VRAM)** under **WSL2 Ubuntu**.
+- A compatible CUDA/PyTorch installation (the repository pins **PyTorch 2.10.0** and a **CUDA 12.8** wheel for the documented environment).
+- Access to the required [Meta SAM 3 / 3.1 model checkpoints](https://github.com/facebookresearch/sam3) on Hugging Face. Checkpoint access may require approval and authentication.
+- Sufficient RAM, disk space, and available GPU memory for input frames and SAM tracking state.
+
+> [!NOTE]
+> These are the **documented development settings**, not a verified cross-platform support matrix. Memory usage depends on frame count, number of objects, prompts, and resolution.
+
+### 1. Clone the repository
+
+```bash
 git clone https://github.com/spi727/digbodha.git
 cd digbodha
- 
-2. Create a Python environment
+```
+
+### 2. Create a Python environment
+
+```bash
 conda create -n cvproj python=3.12 -y
 conda activate cvproj
 python -m pip install --upgrade pip
- 
-3. Install PyTorch and project dependencies
+```
+
+### 3. Install PyTorch and project dependencies
+
 The repository documents the following PyTorch build:
 
+```bash
 pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt -c constraints.txt
- 
-The requirements.txt file installs SAM from Meta’s official repository and the project’s additional dependencies. Use an environment-compatible PyTorch/CUDA configuration if reproducing on different hardware; changes are not covered by the reported evaluation.
+```
 
-4. Obtain SAM checkpoints
-Request checkpoint access following the official SAM 3 setup instructions, then authenticate your machine as instructed by Meta/Hugging Face; for example:
+The `requirements.txt` file installs SAM from [Meta's official repository](https://github.com/facebookresearch/sam3) and the project's additional dependencies. Use an environment-compatible PyTorch/CUDA configuration if reproducing on different hardware; changes are **not** covered by the reported evaluation.
 
+### 4. Obtain SAM checkpoints
+
+Request checkpoint access following the [official SAM 3 setup instructions](https://github.com/facebookresearch/sam3), then authenticate your machine as instructed by Meta/Hugging Face; for example:
+
+```bash
 hf auth login
- 
-Model weights are not bundled with this repository. The code uses the SAM 3.1 video predictor provided by the installed sam3 package.
+```
 
-5. Analyze an MP4 video
+Model weights are **not bundled with this repository**. The code uses the SAM 3.1 video predictor provided by the installed `sam3` package.
+
+### 5. Analyze an MP4 video
+
+```bash
 python analyze.py \
   --video path/to/video.mp4 \
   --prompts "vehicle,person" \
   --out outputs/demo
- 
-analyze.py extracts numbered JPG frames from video inputs before running segmentation. To analyze an existing folder of JPG frames, supply its frame rate:
+```
 
+`analyze.py` extracts numbered JPG frames from video inputs before running segmentation. To analyze an existing folder of JPG frames, supply its frame rate:
+
+```bash
 python analyze.py \
   --video path/to/jpg_frames \
   --fps 10 \
   --prompts "vehicle,person" \
   --out outputs/frame_demo
- 
-For faster runs without an annotated video, add --no_video.
+```
 
-Main command-line options
-Argument	Description	Default
---video	MP4/video file or directory of JPG frames	Required
---prompts	Comma-separated text concepts to track	vehicle,person
---fps	Frame rate; required for a frame folder	Video metadata when available
---out	Output directory	outputs/<video-name>
---max_objects	Maximum objects configured for the predictor	16
---chunk	Video chunk size in frames	60
---overlap	Number of overlapping frames at chunk boundaries	2
---no_video	Skip rendering annotated.mp4	Off
-Outputs
+For faster runs without an annotated video, add `--no_video`.
+
+### Main command-line options
+
+| Argument | Description | Default |
+|---|---|---|
+| `--video` | MP4/video file or directory of JPG frames | **Required** |
+| `--prompts` | Comma-separated text concepts to track | `vehicle,person` |
+| `--fps` | Frame rate; **required for a frame folder** | Video metadata when available |
+| `--out` | Output directory | `outputs/<video-name>` |
+| `--max_objects` | Maximum objects configured for the predictor | `16` |
+| `--chunk` | Video chunk size in frames | `60` |
+| `--overlap` | Number of overlapping frames at chunk boundaries | `2` |
+| `--no_video` | Skip rendering `annotated.mp4` | Off |
+
+## Outputs
+
 A typical run creates:
 
+```text
 outputs/demo/
 ├── frames.csv       # One record per tracked object per frame
 ├── tracks.json      # Per-track summaries and worst observed risk
 ├── annotated.mp4    # Visualized masks, IDs, TTC and risk (unless --no_video)
 ├── run.json         # Run configuration, timing and chunk statistics
 └── frames/          # Extracted JPGs when the input is a video file
- 
-Notable frames.csv columns include:
+```
 
-Field	Meaning
-frame, time_s	Frame index and timestamp
-id, label	Tracked identity and prompted concept
-bx0, by0, bx1, by1	Object bounding box
-zone	left, centre, or right
-raw_dx, raw_dy	Observed image displacement
-own_dx, own_dy	Camera-compensated displacement
-motion	still, moving_left, moving_right, or moving
-ttc_s, ttc_lo, ttc_hi	Estimated TTC and low/high band in seconds
-miss_widths	Predicted miss distance in object heights (legacy column name)
-on_course	Whether predicted miss distance is inside the on-course threshold
-risk, reliable, reasons	Risk category and reliability diagnostics
-Repository structure
+Notable `frames.csv` columns include:
+
+| Field | Meaning |
+|---|---|
+| `frame`, `time_s` | Frame index and timestamp |
+| `id`, `label` | Tracked identity and prompted concept |
+| `bx0`, `by0`, `bx1`, `by1` | Object bounding box |
+| `zone` | `left`, `centre`, or `right` |
+| `raw_dx`, `raw_dy` | Observed image displacement |
+| `own_dx`, `own_dy` | Camera-compensated displacement |
+| `motion` | `still`, `moving_left`, `moving_right`, or `moving` |
+| `ttc_s`, `ttc_lo`, `ttc_hi` | Estimated TTC and low/high band in seconds |
+| `miss_widths` | Predicted miss distance in object **heights** (legacy column name) |
+| `on_course` | Whether predicted miss distance is inside the on-course threshold |
+| `risk`, `reliable`, `reasons` | Risk category and reliability diagnostics |
+
+## Repository structure
+
+```text
 digbodha/
 ├── analyze.py                  # Main inference and output pipeline
 ├── src/
@@ -243,128 +294,171 @@ digbodha/
 ├── Digbodha1.ipynb           # Project notebook
 ├── requirements.txt
 └── constraints.txt
- 
-Evaluation and results
-Benchmark and protocol
-We evaluated on the KITTI Object Tracking dataset (10 FPS), which supplies per-frame 3D object annotations. KITTI does not directly provide the TTC labels used here; the evaluator derives reference TTC from object depth Z and its estimated slope:
+```
 
-$$ \mathrm{TTC}_{\mathrm{GT}}=\frac{Z}{-dZ/dt}\quad\text{when the object is approaching}. $$
+## Evaluation and results
 
-Predictions are matched to labelled objects by compatible class and 2D bounding-box IoU ≥ 0.5. Evaluation considers labelled objects within 40 m. TTC error is calculated on matched predictions with approaching ground truth and a predicted TTC; detection coverage and alert metrics must be read separately.
+### Benchmark and protocol
 
-Split	KITTI sequences	Role
-Development	0000	Debugging
-Tuning	0013, 0001, 0020	Choose rules and reliability checks
-Held-out	0019, 0007	Evaluation after finalizing the approach
-Reported results
-Final configuration: height-based TTC with width fallback, no added debounce.
+We evaluated on the **KITTI Object Tracking** dataset (10 FPS), which supplies per-frame 3D object annotations. KITTI does not directly provide the TTC labels used here; the evaluator derives reference TTC from object depth `Z` and its estimated slope:
 
-Metric	Tuning	Held-out (pooled)
-Median relative TTC error, reliable estimates	12.9%	11.5%
-Approach-detection precision	0.97	0.93
-Approach-detection recall	0.89	0.90
-Alert precision, per matched object-frame	0.66	0.56
-Alert recall, per matched object-frame	0.58	0.45
-Recall when uncertain also counts as caught	0.81	0.70
-Hazard events warned	129 / 149 (87%)	40 / 57 (70%)
-False-alarm events	32	24
-Median warning lead time	0.9 s	1.2 s
-On held-out sequences, TTC estimates flagged unreliable had roughly 60–70% median relative error, versus 11.5% for reliable estimates. The reliability flag therefore identified many difficult measurements, but the final alerting performance remained substantially weaker than TTC estimation on reliable matched objects.
+$$
+\mathrm{TTC}_{\mathrm{GT}}=\frac{Z}{-dZ/dt}\quad\text{when the object is approaching}.
+$$
 
-Important interpretation: The 11.5% TTC figure is conditional on estimates being available, matched, and labelled reliable; it is not an end-to-end collision-warning accuracy figure. Similarly, 70% refers to the specific held-out hazard-event protocol, not to deployment safety performance.
+Predictions are matched to labelled objects by compatible class and **2D bounding-box IoU ≥ 0.5**. Evaluation considers labelled objects within **40 m**. TTC error is calculated on matched predictions with approaching ground truth and a predicted TTC; detection coverage and alert metrics must be read separately.
 
-Run a KITTI evaluation
-Obtain KITTI Tracking images and annotations from the official dataset website under its terms, and arrange them in the locations expected by the scripts. For an already prepared JPG sequence and corresponding labels:
+| Split | KITTI sequences | Role |
+|---|---|---|
+| Development | `0000` | Debugging |
+| Tuning | `0013`, `0001`, `0020` | Choose rules and reliability checks |
+| Held-out | `0019`, `0007` | Evaluation after finalizing the approach |
 
+### Reported results
+
+**Final configuration:** height-based TTC with width fallback, no added debounce.
+
+| Metric | Tuning | Held-out (pooled) |
+|---|---:|---:|
+| Median relative TTC error, **reliable** estimates | **12.9%** | **11.5%** |
+| Approach-detection precision | 0.97 | **0.93** |
+| Approach-detection recall | 0.89 | **0.90** |
+| Alert precision, per matched object-frame | 0.66 | **0.56** |
+| Alert recall, per matched object-frame | 0.58 | **0.45** |
+| Recall when `uncertain` also counts as caught | 0.81 | **0.70** |
+| Hazard events warned | 129 / 149 (**87%**) | **40 / 57 (70%)** |
+| False-alarm events | 32 | **24** |
+| Median warning lead time | 0.9 s | **1.2 s** |
+
+On held-out sequences, TTC estimates flagged **unreliable** had roughly **60–70% median relative error**, versus **11.5%** for reliable estimates. The reliability flag therefore identified many difficult measurements, but the final alerting performance remained substantially weaker than TTC estimation on reliable matched objects.
+
+**Important interpretation:** The **11.5% TTC figure is conditional** on estimates being available, matched, and labelled reliable; it is **not** an end-to-end collision-warning accuracy figure. Similarly, **70%** refers to the specific held-out hazard-event protocol, not to deployment safety performance.
+
+### Run a KITTI evaluation
+
+Obtain KITTI Tracking images and annotations from the [official dataset website](https://www.cvlibs.net/datasets/kitti/eval_tracking.php) under its terms, and arrange them in the locations expected by the scripts. For an already prepared JPG sequence and corresponding labels:
+
+```bash
 python analyze.py \
   --video data/kitti_0013_340 \
   --fps 10 \
   --out outputs/kitti_0013 \
   --no_video
- 
+
 python eval/evaluate_kitti.py \
   --pred outputs/kitti_0013/frames.csv \
   --labels "$HOME/datasets/kitti_tracking/training/label_02/0013.txt" \
   --fps 10 \
   --out outputs/eval_0013
- 
+```
+
 To pool evaluation outputs:
 
+```bash
 python eval/aggregate.py \
   outputs/eval_0013 outputs/eval_0001 outputs/eval_0020 \
   --out outputs/eval_pooled
- 
+
 python eval/analyze_errors.py \
   outputs/eval_0013 outputs/eval_0001 outputs/eval_0020
- 
+```
+
 A batch runner is also provided:
 
+```bash
 # Point KITTI at the extracted tracking dataset root and ZIP at the image archive.
 export KITTI="$HOME/datasets/kitti_tracking"
 export ZIP="/path/to/data_tracking_image_2.zip"
- 
+
 bash scripts/run_kitti_eval.sh 0013:340 0001:426 0020:300
- 
-The batch script uses local dataset paths: edit or set KITTI and ZIP for your machine. KITTI files and SAM checkpoints are downloaded separately; neither dataset nor model weights are supplied with the project.
+```
 
-Re-score TTC and risk without re-running SAM
-Saved frames.csv measurements can be reused to test changes to the risk stage:
+The batch script uses local dataset paths: **edit or set `KITTI` and `ZIP` for your machine**. KITTI files and SAM checkpoints are downloaded separately; neither dataset nor model weights are supplied with the project.
 
+### Re-score TTC and risk without re-running SAM
+
+Saved `frames.csv` measurements can be reused to test changes to the risk stage:
+
+```bash
 python eval/rescore.py \
   --pred outputs/kitti_0013/frames.csv \
   --frames data/kitti_0013_340 \
   --fps 10 \
   --out outputs/kitti_0013_rescored/frames.csv \
   --debounce 2
- 
-This only re-runs the TTC/risk calculations; it does not re-run segmentation or change the underlying tracked objects. This made the team’s ablation experiments much faster.
+```
 
-Ablations and engineering decisions
-Design decision	Observation
-Fit 1/s instead of log(s)	On one test approach (true TTC 1.50 s), estimated TTC improved from 1.89 s to 1.55 s
-Use object height over mask area	Reduced sensitivity to thin masks and changing visible width
-Use width fallback for certain top/bottom cuts	Improved tuning-set warned hazards from 127 to 129 of 149 without extra false-alarm events
-Enable 2-frame debounce	Reduced tuning false-alarm events from 32 to 21, but warned only 123 instead of 129 hazards
-Use chunked SAM inference	Avoided persistent video-tracker memory growth on the tested 8 GB GPU
-Runtime
-On the reported RTX 5060 Laptop GPU (8 GB), SAM inference was the main bottleneck. The document reports around 2.1 FPS with one prompt, 0.6–1 FPS with two prompts, and approximately 25 ms per frame for the classical ego-motion and TTC stages. These figures are observations from that environment, not general performance guarantees.
+This only re-runs the TTC/risk calculations; it does **not** re-run segmentation or change the underlying tracked objects. This made the team's ablation experiments much faster.
 
-Limitations
-Offline speed: Full pipeline is not real-time on the tested 8 GB laptop GPU.
-Crowded scenes: The default 16-object limit can reduce tracking coverage.
-No long-term re-identification: Objects returning after leaving the view receive new IDs.
-Approximate camera-motion model: A single homography cannot fully represent 3D parallax.
-Simple future-motion assumption: Accelerations, braking, and curved pedestrian trajectories can invalidate extrapolations.
-Threshold sensitivity: Small TTC errors near the risk cutoffs create false warnings.
-Truncation and segmentation noise: Partial visibility can distort object size and position.
-2D geometric output: TTC is in seconds, and lateral miss distance is in object-height units—not metric 3D trajectory reconstruction.
-Heading assumption: Image centre is treated as the approximate path direction.
-Evaluation domain: Reported experiments use KITTI driving scenes, not pedestrian-mounted cameras or Indian traffic environments.
-Future directions
-Potential extensions, not implemented or validated in the reported results, include:
+### Ablations and engineering decisions
 
-Substitute a faster open-vocabulary segmenter/tracker, such as a suitable YOLOE variant, for SAM 3.1.
-Improve tracking capacity and re-identification in crowded scenes.
-Replace straight-line motion extrapolation with models that handle changes in velocity and direction.
-Replace rigid warning thresholds with better-calibrated risk estimates.
-Evaluate on pedestrian viewpoints, different camera motions, and more diverse road environments.
-Explore structured object-motion annotations for uncertainty-aware vision-language assistance.
-Authors
-K. Praveen Sagar · CS26M1002
-Arnav Abhijit Rajurkar · CS26M1007
-Madhur Vijay Patil · CS26M1024
+| Design decision | Observation |
+|---|---|
+| Fit `1/s` instead of `log(s)` | On one test approach (true TTC 1.50 s), estimated TTC improved from 1.89 s to 1.55 s |
+| Use object height over mask area | Reduced sensitivity to thin masks and changing visible width |
+| Use width fallback for certain top/bottom cuts | Improved tuning-set warned hazards from 127 to 129 of 149 without extra false-alarm events |
+| Enable 2-frame debounce | Reduced tuning false-alarm events from 32 to 21, but warned only 123 instead of 129 hazards |
+| Use chunked SAM inference | Avoided persistent video-tracker memory growth on the tested 8 GB GPU |
 
-M.Tech CSE (Data Science & AI)
-Indian Institute of Information Technology, Design and Manufacturing (IIITDM), Kancheepuram
+### Runtime
 
-Computer Vision course project · November 2026
+On the reported RTX 5060 Laptop GPU (8 GB), SAM inference was the main bottleneck. The document reports around **2.1 FPS with one prompt**, **0.6–1 FPS with two prompts**, and approximately **25 ms per frame** for the classical ego-motion and TTC stages. These figures are observations from that environment, **not general performance guarantees**.
 
-References
+## Limitations
+
+- **Offline speed:** Full pipeline is not real-time on the tested 8 GB laptop GPU.
+- **Crowded scenes:** The default 16-object limit can reduce tracking coverage.
+- **No long-term re-identification:** Objects returning after leaving the view receive new IDs.
+- **Approximate camera-motion model:** A single homography cannot fully represent 3D parallax.
+- **Simple future-motion assumption:** Accelerations, braking, and curved pedestrian trajectories can invalidate extrapolations.
+- **Threshold sensitivity:** Small TTC errors near the risk cutoffs create false warnings.
+- **Truncation and segmentation noise:** Partial visibility can distort object size and position.
+- **2D geometric output:** TTC is in seconds, and lateral miss distance is in object-height units—not metric 3D trajectory reconstruction.
+- **Heading assumption:** Image centre is treated as the approximate path direction.
+- **Evaluation domain:** Reported experiments use KITTI driving scenes, not pedestrian-mounted cameras or Indian traffic environments.
+
+## Future directions
+
+Potential extensions, **not implemented or validated in the reported results**, include:
+
+1. Substitute a faster open-vocabulary segmenter/tracker, such as a suitable YOLOE variant, for SAM 3.1.
+2. Improve tracking capacity and re-identification in crowded scenes.
+3. Replace straight-line motion extrapolation with models that handle changes in velocity and direction.
+4. Replace rigid warning thresholds with better-calibrated risk estimates.
+5. Evaluate on pedestrian viewpoints, different camera motions, and more diverse road environments.
+6. Explore structured object-motion annotations for uncertainty-aware vision-language assistance.
+
+## Authors
+
+**K. Praveen Sagar** · CS26M1002  
+**Arnav Abhijit Rajurkar** · CS26M1007  
+**Madhur Vijay Patil** · CS26M1024
+
+M.Tech CSE (Data Science & AI)  
+**Indian Institute of Information Technology, Design and Manufacturing (IIITDM), Kancheepuram**
+
+*Computer Vision course project · November 2026*
+
+## References
+
 The project builds upon the following published methods and upstream resources:
 
-N. Carion et al., “SAM 3: Segment Anything with Concepts”, 2025. arXiv:2511.16719; Meta SAM 3 repository.
-A. Geiger, P. Lenz, and R. Urtasun, “Are We Ready for Autonomous Driving? The KITTI Vision Benchmark Suite”, CVPR, 2012. KITTI.
-D. N. Lee, “A Theory of Visual Control of Braking Based on Information about Time-to-Collision”, Perception, 1976.
-B. D. Lucas and T. Kanade, “An Iterative Image Registration Technique with an Application to Stereo Vision”, IJCAI, 1981.
-J. Shi and C. Tomasi, “Good Features to Track”, CVPR, 1994.
-C. Harris and M. Stephens, “A Combined Corner and 
+1. N. Carion et al., **“SAM 3: Segment Anything with Concepts”**, 2025. [arXiv:2511.16719](https://arxiv.org/abs/2511.16719); [Meta SAM 3 repository](https://github.com/facebookresearch/sam3).
+2. A. Geiger, P. Lenz, and R. Urtasun, **“Are We Ready for Autonomous Driving? The KITTI Vision Benchmark Suite”**, CVPR, 2012. [KITTI](https://www.cvlibs.net/datasets/kitti/).
+3. D. N. Lee, **“A Theory of Visual Control of Braking Based on Information about Time-to-Collision”**, *Perception*, 1976.
+4. B. D. Lucas and T. Kanade, **“An Iterative Image Registration Technique with an Application to Stereo Vision”**, IJCAI, 1981.
+5. J. Shi and C. Tomasi, **“Good Features to Track”**, CVPR, 1994.
+6. C. Harris and M. Stephens, **“A Combined Corner and Edge Detector”**, Alvey Vision Conference, 1988.
+7. J.-Y. Bouguet, **“Pyramidal Implementation of the Lucas Kanade Feature Tracker”**, 2001.
+8. Z. Kalal, K. Mikolajczyk, and J. Matas, **“Forward–Backward Error: Automatic Detection of Tracking Failures”**, ICPR, 2010.
+9. M. A. Fischler and R. C. Bolles, **“Random Sample Consensus: A Paradigm for Model Fitting with Applications to Image Analysis and Automated Cartography”**, *Communications of the ACM*, 1981.
+10. H. W. Kuhn, **“The Hungarian Method for the Assignment Problem”**, *Naval Research Logistics Quarterly*, 1955.
+11. Ultralytics, **YOLO26 documentation**, 2026. [Documentation](https://docs.ultralytics.com/models/yolo26/).
+
+---
+
+<div align="center">
+
+**DigBodha 1 — From seeing objects to estimating their motion, approach, and risk.**
+
+</div>
