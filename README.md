@@ -239,6 +239,15 @@ For faster runs without an annotated video, add `--no_video`.
 | `--overlap` | Number of overlapping frames at chunk boundaries | `2` |
 | `--no_video` | Skip rendering `annotated.mp4` | Off |
 
+### Web UI
+
+A browser front end for exploring runs ships in [`ui/`](ui/README.md). It includes the held-out KITTI 0007 run, so it works without a GPU:
+
+```bash
+cd ui && npm install && npm run dev        # demo run, no backend needed
+python ui/server.py                        # optional: your outputs/ runs + live analysis
+```
+
 ## Outputs
 
 A typical run creates:
