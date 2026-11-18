@@ -7,7 +7,8 @@ outputs/
 *.safetensors
 __pycache__/
 .ipynb_checkpoints/
-.envdigbodha_results_pack.zip
+.env
+digbodha_results_pack.zip
 
 # web UI
 ui/node_modules/

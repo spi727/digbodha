@@ -85,7 +85,7 @@ export function Evaluation() {
           </p>
         </section>
         <section className="card">
-          <div className="card__head"><h3>TTC error by distance</h3><span className="muted small">median relative error, all estimates</span></div>
+          <div className="card__head"><h3>TTC error by distance</h3><span className="muted small">median relative error, reliable estimates</span></div>
           <DepthBars d={cur.ttc_by_depth} />
         </section>
       </div>
